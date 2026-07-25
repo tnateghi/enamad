@@ -1,9 +1,18 @@
 """Root shim — forwards to the package location."""
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
-import runpy, os  # noqa: E402
-os.chdir(str(pathlib.Path(__file__).resolve().parent))
-runpy.run_path(
-    str(pathlib.Path(__file__).resolve().parent / "src/enamad/scraper/extract_enamad.py"),
-    run_name="__main__",
+import sys
+import pathlib
+
+_root = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_root / "src"))
+
+from enamad.scraper.extract_enamad import (  # noqa: E402
+    EnamadClient,
+    TRUSTSEAL_LABELS,
+    clean_domain,
+    main,
+    maybe_enrich_row,
+    normalize_search_row,
 )
+
+if __name__ == "__main__":
+    raise SystemExit(main())
