@@ -23,6 +23,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,7 +31,9 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = SCRIPT_DIR / "config.ini"
+REPO_ROOT = SCRIPT_DIR.parents[2]
+EXTRACT_SCRIPT = SCRIPT_DIR.parent / "scraper" / "extract_enamad.py"
+DEFAULT_CONFIG = REPO_ROOT / "config.ini"
 
 from logging_setup import setup_logging
 
@@ -93,7 +96,7 @@ def load_scheduler_config(path: Path) -> SchedulerConfig:
         refresh_workers=get_int("refresh_workers", 4),
         refresh_missing_only=get_bool("refresh_missing_only", True),
         refresh_newest_first=get_bool("refresh_newest_first", True),
-        run_on_start=get_bool("run_on_start", False),
+        run_on_start=get_bool("run_on_start", True),
         enable_update=get_bool("enable_update", True),
         enable_refresh=get_bool("enable_refresh", True),
         enable_automation_flush=get_bool("enable_automation_flush", True),
@@ -101,12 +104,43 @@ def load_scheduler_config(path: Path) -> SchedulerConfig:
     )
 
 
+def _ensure_import_paths() -> None:
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    if str(REPO_ROOT / "src") not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+
+
+def wait_for_mysql(config_path: Path, timeout_sec: int = 300, interval_sec: float = 5.0) -> bool:
+    """Block until MySQL accepts connections (common after host/container reboot)."""
+    _ensure_import_paths()
+    from db import load_config, mysql_connection
+
+    deadline = time.monotonic() + timeout_sec
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            cfg = load_config(config_path)
+            with mysql_connection(cfg.mysql) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            log.info("MySQL is ready (attempt %d).", attempt)
+            return True
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                log.error("MySQL not ready after %ds: %s", timeout_sec, exc)
+                return False
+            log.warning("Waiting for MySQL (attempt %d): %s", attempt, exc)
+            time.sleep(interval_sec)
+
+
 def _run(label: str, extra_args: list[str], config_path: Path) -> None:
-    cmd = [sys.executable, str(SCRIPT_DIR / "extract_enamad.py"), *extra_args,
+    cmd = [sys.executable, str(EXTRACT_SCRIPT), *extra_args,
            "--config", str(config_path)]
     log.info("Running job '%s': %s", label, " ".join(extra_args))
     try:
-        result = subprocess.run(cmd, cwd=str(SCRIPT_DIR))
+        result = subprocess.run(cmd, cwd=str(REPO_ROOT))
         if result.returncode == 0:
             log.info("Job '%s' finished successfully.", label)
         else:
@@ -187,6 +221,10 @@ def main() -> int:
                 config_path = alt
 
     cfg = load_scheduler_config(config_path)
+
+    if not wait_for_mysql(config_path):
+        return 1
+
     scheduler = BlockingScheduler(timezone=cfg.timezone)
 
     update_job = make_update_job(cfg, config_path)
@@ -201,6 +239,7 @@ def main() -> int:
             name="Fetch new domains",
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=3600,
         )
         log.info("Scheduled 'update' with cron '%s' (%s).", cfg.update_cron, cfg.timezone)
 
@@ -212,6 +251,7 @@ def main() -> int:
             name="Refresh stale domains",
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=3600,
         )
         log.info(
             "Scheduled 'refresh-stale' with cron '%s' (%s)%s%s.",
@@ -229,6 +269,7 @@ def main() -> int:
             name="Flush queued automation SMS",
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=600,
         )
         log.info(
             "Scheduled 'automation-flush' with cron '%s' (%s).",

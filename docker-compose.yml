@@ -126,8 +126,10 @@ services:
       SCHED_REFRESH_WORKERS: ${SCHED_REFRESH_WORKERS:-4}
       SCHED_REFRESH_MISSING_ONLY: ${SCHED_REFRESH_MISSING_ONLY:-yes}
       SCHED_REFRESH_NEWEST_FIRST: ${SCHED_REFRESH_NEWEST_FIRST:-yes}
-      SCHED_RUN_ON_START: ${SCHED_RUN_ON_START:-no}
+      SCHED_RUN_ON_START: ${SCHED_RUN_ON_START:-yes}
     depends_on:
+      mysql:
+        condition: service_healthy
       init:
         condition: service_completed_successfully
     volumes:
