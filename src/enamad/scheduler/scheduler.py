@@ -3,12 +3,12 @@
 """
 Portable task scheduler for the Enamad project (Laravel-scheduler style).
 
-Runs two recurring jobs by shelling out to extract_enamad.py:
-  1. --update        : fetch newly-added domains (cheap, tail pages only)
-  2. --refresh-stale : refresh existing domains via trust seal (no captcha)
+Runs three recurring scrape jobs via extract_enamad.py:
+  1. --update              : fetch newly-added domains (first N list pages, captcha)
+  2. --refresh-stale       : fill missing contact info (trust seal, no captcha)
+  3. --refresh-stale       : weekly touch-up for domains with complete info
 
-Frequencies are configurable via config.ini ([scheduler] section) or env vars,
-so the same file works on Windows (dev), Linux, and inside Docker.
+Frequencies are configurable via config.ini ([scheduler] section) or SCHED_* env vars.
 
 Run:
   python scheduler.py
@@ -56,15 +56,17 @@ class SchedulerConfig:
     update_pages: int
     update_workers: int
     update_chunk_pages: int
-    refresh_cron: str
-    refresh_days: int
-    refresh_limit: int
+    refresh_missing_cron: str
+    refresh_missing_limit: int
+    refresh_full_cron: str
+    refresh_full_days: int
+    refresh_full_limit: int
     refresh_workers: int
-    refresh_missing_only: bool
     refresh_newest_first: bool
     run_on_start: bool
     enable_update: bool
-    enable_refresh: bool
+    enable_refresh_missing: bool
+    enable_refresh_full: bool
     enable_automation_flush: bool
     automation_flush_cron: str
 
@@ -84,21 +86,37 @@ def load_scheduler_config(path: Path) -> SchedulerConfig:
     def get_bool(key: str, fallback: bool) -> bool:
         return get(key, "yes" if fallback else "no").lower() in ("1", "true", "yes", "on")
 
+    # Legacy SCHED_REFRESH_CRON still maps to the missing-details job.
+    refresh_missing_cron = (
+        _env("SCHED_REFRESH_MISSING_CRON")
+        or get("refresh_missing_cron", "")
+        or get("refresh_cron", "30 */6 * * *")
+    )
+    refresh_missing_limit = get_int(
+        "refresh_missing_limit",
+        get_int("refresh_limit", 400),
+    )
+
     return SchedulerConfig(
         timezone=get("timezone", "Asia/Tehran"),
-        update_cron=get("update_cron", "0 3 * * *"),
+        update_cron=get("update_cron", "0 */4 * * *"),
         update_pages=get_int("update_pages", 50),
         update_workers=get_int("update_workers", 1),
         update_chunk_pages=get_int("update_chunk_pages", 10),
-        refresh_cron=get("refresh_cron", "0 */6 * * *"),
-        refresh_days=get_int("refresh_days", 30),
-        refresh_limit=get_int("refresh_limit", 500),
+        refresh_missing_cron=refresh_missing_cron,
+        refresh_missing_limit=refresh_missing_limit,
+        refresh_full_cron=get("refresh_full_cron", "0 4 * * 0"),
+        refresh_full_days=get_int("refresh_full_days", 7),
+        refresh_full_limit=get_int("refresh_full_limit", 500),
         refresh_workers=get_int("refresh_workers", 4),
-        refresh_missing_only=get_bool("refresh_missing_only", True),
         refresh_newest_first=get_bool("refresh_newest_first", True),
         run_on_start=get_bool("run_on_start", True),
         enable_update=get_bool("enable_update", True),
-        enable_refresh=get_bool("enable_refresh", True),
+        enable_refresh_missing=get_bool(
+            "enable_refresh_missing",
+            get_bool("enable_refresh", True),
+        ),
+        enable_refresh_full=get_bool("enable_refresh_full", True),
         enable_automation_flush=get_bool("enable_automation_flush", True),
         automation_flush_cron=get("automation_flush_cron", "*/10 * * * *"),
     )
@@ -162,20 +180,39 @@ def make_update_job(cfg: SchedulerConfig, config_path: Path):
     return job
 
 
-def make_refresh_job(cfg: SchedulerConfig, config_path: Path):
+def make_refresh_missing_job(cfg: SchedulerConfig, config_path: Path):
+    """Refresh domains that lack address/phone/email (priority)."""
+
     def job() -> None:
         args = [
             "--refresh-stale",
-            "--stale-days", str(cfg.refresh_days),
-            "--refresh-limit", str(cfg.refresh_limit),
+            "--stale-days", "0",
+            "--refresh-limit", str(cfg.refresh_missing_limit),
+            "--refresh-workers", str(cfg.refresh_workers),
+            "--delay", "0",
+            "--missing-only",
+        ]
+        if cfg.refresh_newest_first:
+            args.append("--newest-first")
+        _run("refresh-missing", args, config_path)
+
+    return job
+
+
+def make_refresh_full_job(cfg: SchedulerConfig, config_path: Path):
+    """Weekly refresh for domains whose details are already complete."""
+
+    def job() -> None:
+        args = [
+            "--refresh-stale",
+            "--stale-days", str(cfg.refresh_full_days),
+            "--refresh-limit", str(cfg.refresh_full_limit),
             "--refresh-workers", str(cfg.refresh_workers),
             "--delay", "0",
         ]
-        if cfg.refresh_missing_only:
-            args.append("--missing-only")
         if cfg.refresh_newest_first:
             args.append("--newest-first")
-        _run("refresh-stale", args, config_path)
+        _run("refresh-full", args, config_path)
 
     return job
 
@@ -185,11 +222,7 @@ def make_automation_flush_job(config_path: Path):
 
     def job() -> None:
         try:
-            repo_root = SCRIPT_DIR.parents[2]
-            if str(repo_root) not in sys.path:
-                sys.path.insert(0, str(repo_root))
-            if str(repo_root / "src") not in sys.path:
-                sys.path.insert(0, str(repo_root / "src"))
+            _ensure_import_paths()
 
             from db import load_config, mysql_connection
             from crm_db import ensure_crm_tables
@@ -214,7 +247,6 @@ def main() -> int:
     config_path = Path(parsed.config)
     if not config_path.is_absolute():
         config_path = SCRIPT_DIR / config_path
-        # Config usually lives at repo root, not next to the package module.
         if not config_path.is_file():
             alt = SCRIPT_DIR.parents[2] / parsed.config
             if alt.is_file():
@@ -228,7 +260,8 @@ def main() -> int:
     scheduler = BlockingScheduler(timezone=cfg.timezone)
 
     update_job = make_update_job(cfg, config_path)
-    refresh_job = make_refresh_job(cfg, config_path)
+    refresh_missing_job = make_refresh_missing_job(cfg, config_path)
+    refresh_full_job = make_refresh_full_job(cfg, config_path)
     automation_flush_job = make_automation_flush_job(config_path)
 
     if cfg.enable_update:
@@ -243,22 +276,39 @@ def main() -> int:
         )
         log.info("Scheduled 'update' with cron '%s' (%s).", cfg.update_cron, cfg.timezone)
 
-    if cfg.enable_refresh:
+    if cfg.enable_refresh_missing:
         scheduler.add_job(
-            refresh_job,
-            CronTrigger.from_crontab(cfg.refresh_cron, timezone=cfg.timezone),
-            id="refresh-stale",
-            name="Refresh stale domains",
+            refresh_missing_job,
+            CronTrigger.from_crontab(cfg.refresh_missing_cron, timezone=cfg.timezone),
+            id="refresh-missing",
+            name="Refresh domains missing contact info",
             max_instances=1,
             coalesce=True,
             misfire_grace_time=3600,
         )
         log.info(
-            "Scheduled 'refresh-stale' with cron '%s' (%s)%s%s.",
-            cfg.refresh_cron,
+            "Scheduled 'refresh-missing' with cron '%s' (%s), limit %d.",
+            cfg.refresh_missing_cron,
             cfg.timezone,
-            " [missing-only]" if cfg.refresh_missing_only else "",
-            " [newest-first]" if cfg.refresh_newest_first else "",
+            cfg.refresh_missing_limit,
+        )
+
+    if cfg.enable_refresh_full:
+        scheduler.add_job(
+            refresh_full_job,
+            CronTrigger.from_crontab(cfg.refresh_full_cron, timezone=cfg.timezone),
+            id="refresh-full",
+            name="Weekly refresh of complete domains",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=7200,
+        )
+        log.info(
+            "Scheduled 'refresh-full' with cron '%s' (%s), older than %d days, limit %d.",
+            cfg.refresh_full_cron,
+            cfg.timezone,
+            cfg.refresh_full_days,
+            cfg.refresh_full_limit,
         )
 
     if cfg.enable_automation_flush:
@@ -282,13 +332,13 @@ def main() -> int:
         return 1
 
     if cfg.run_on_start:
-        log.info("run_on_start enabled — running jobs once now.")
+        log.info("run_on_start enabled — running priority jobs now (update first).")
         if cfg.enable_automation_flush:
             automation_flush_job()
-        if cfg.enable_refresh:
-            refresh_job()
         if cfg.enable_update:
             update_job()
+        if cfg.enable_refresh_missing:
+            refresh_missing_job()
 
     log.info("Scheduler started. Press Ctrl+C to exit.")
     try:
